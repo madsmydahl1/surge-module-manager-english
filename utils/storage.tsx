@@ -1,0 +1,842 @@
+import { Path } from "scripting"
+import { loadConfig } from "./config"
+import { backupModulePath, restoreModuleBackup } from "./backups"
+import { replaceTextVerified } from "./verified_write"
+
+export type ModuleInfo = {
+  name: string
+  link: string
+  /** Original source URL kept by a third-party conversion adapter, if any. */
+  sourceURL?: string
+  surgeName?: string
+  category?: string
+  icon?: string
+  filePath?: string
+  saveDir?: string
+  isLocal?: boolean
+  /** Legacy marker: the module's remote [Script] references were localized. */
+  localScripts?: boolean
+  /** The module's remote scripts, rule sets, and includes have been localized. */
+  localResources?: boolean
+  content?: string
+}
+
+const BASE_DIR_NAME = "SurgeModulesManager"
+const MODULES_DIR_NAME = "Modules"
+const SURGE_MODULE_DIR_NAME = "Module"
+const LEGACY_RESOURCE_DIR_NAME = ".scripting-resources"
+const BUILTIN_LINK_PREFIXES = ["#!url=", "#SUBSCRIBED"]
+
+function fmOrThrow(): any {
+  const fm = (globalThis as any).FileManager
+  if (!fm) throw new Error("FileManager is unavailable")
+  return fm
+}
+
+function isPromiseLike(v: any): v is Promise<any> {
+  return !!v && typeof v === "object" && typeof v.then === "function"
+}
+
+async function callMaybeAsync(fn: any, thisArg: any, args: any[]) {
+  try {
+    const r = fn.apply(thisArg, args)
+    return isPromiseLike(r) ? await r : r
+  } catch {
+    return undefined
+  }
+}
+
+function normalizePath(path: string): string {
+  const raw = String(path ?? "").replace(/\\/g, "/")
+  const absolute = raw.startsWith("/")
+  const parts: string[] = []
+  for (const part of raw.split("/")) {
+    if (!part || part === ".") continue
+    if (part === "..") {
+      if (parts.length && parts[parts.length - 1] !== "..") parts.pop()
+      else if (!absolute) parts.push(part)
+      continue
+    }
+    parts.push(part)
+  }
+  const normalized = `${absolute ? "/" : ""}${parts.join("/")}`
+  return normalized === "/" ? normalized : normalized.replace(/\/+$/, "")
+}
+
+function pickRootDir(): string {
+  const fm = fmOrThrow()
+  if (fm.isiCloudEnabled && fm.iCloudDocumentsDirectory) {
+    return fm.iCloudDocumentsDirectory
+  }
+  return fm.documentsDirectory || fm.appGroupDocumentsDirectory || fm.scriptsDirectory || ""
+}
+
+export function getBaseDir(): string {
+  const cfg = loadConfig()
+  if (cfg.baseDir) return cfg.baseDir
+  return Path.join(pickRootDir(), BASE_DIR_NAME)
+}
+
+export function getModulesDir(): string {
+  const cfg = loadConfig()
+  if (cfg.baseDir) return surgeModuleDirectory(cfg.baseDir)
+  // Do not silently fall back to Scripting's private documents directory.
+  // Callers that write modules must surface the missing Surge bookmark.
+  return ""
+}
+
+/**
+ * Resolve the real Surge module directory without confusing it with the
+ * selected bookmark boundary. The user selects `iCloud Drive/Surge`; Surge's
+ * local modules live in its `Module` child. Selecting that child directly is
+ * also accepted so an existing setup is not nested as `Module/Module`.
+ */
+function surgeModuleDirectory(root: string): string {
+  const normalized = normalizePath(root)
+  if (!normalized) return ""
+  const last = normalized.split("/").pop()?.toLowerCase() ?? ""
+  if (last === "module" || last === "modules") return normalized
+  return Path.join(normalized, SURGE_MODULE_DIR_NAME)
+}
+
+async function resolveBookmarkedPath(rawPath: string, bookmarkName?: string): Promise<string> {
+  const fm = fmOrThrow()
+  const raw = String(rawPath ?? "").trim()
+  const name = String(bookmarkName ?? "").trim()
+  if (!raw && !name) return ""
+  if (!fm?.bookmarkedPath) return raw
+
+  if (name) {
+    let nameExists = true
+    if (fm?.bookmarkExists) {
+      const existed = await callMaybeAsync(fm.bookmarkExists, fm, [name])
+      nameExists = !!existed
+    }
+    if (nameExists) {
+      const byName = await callMaybeAsync(fm.bookmarkedPath, fm, [name])
+      if (byName) return String(byName)
+    }
+  }
+  if (!fm?.getAllFileBookmarks) return raw
+
+  const list = await callMaybeAsync(fm.getAllFileBookmarks, fm, [])
+  const arr = Array.isArray(list) ? list : []
+  const target = normalizePath(raw)
+  const match = arr.find((b: any) => {
+    const p = normalizePath(String(b?.path ?? ""))
+    const n = String(b?.name ?? "")
+    return (p && p === target) || (name ? n === name : false)
+  })
+  if (match?.name) {
+    const resolved = await callMaybeAsync(fm.bookmarkedPath, fm, [match.name])
+    if (resolved) return String(resolved)
+  }
+
+  // If bookmark name is configured but cannot be resolved, do not trust stale raw path.
+  if (name) return ""
+  return raw
+}
+
+export async function getModulesDirResolved(baseDir?: string): Promise<string> {
+  const cfg = loadConfig()
+  const configured = String(cfg.baseDir ?? "").trim()
+  const bookmarkName = String(cfg.baseBookmarkName ?? "").trim()
+  const target = String(baseDir ?? "").trim()
+  if (!configured && !target) return ""
+
+  if (!target) {
+    if (!configured) return ""
+    const resolved = await resolveBookmarkedPath(configured, bookmarkName)
+    if (resolved) return surgeModuleDirectory(resolved)
+    return bookmarkName ? "" : surgeModuleDirectory(configured)
+  }
+
+  if (configured && normalizePath(target) === normalizePath(configured)) {
+    const resolved = await resolveBookmarkedPath(target, bookmarkName)
+    if (resolved) return surgeModuleDirectory(resolved)
+    return bookmarkName ? "" : surgeModuleDirectory(target)
+  }
+  return target
+}
+
+/**
+ * Return the resolved iCloud/Surge profile directory selected by the user.
+ *
+ * Return the selected iCloud/Surge bookmark boundary. This is deliberately
+ * separate from `getModulesDirResolved()`, which points at `Surge/Module`.
+ * Keeping the two paths separate lets us validate every write against the
+ * user's bookmark while generating resource paths relative to the directory
+ * that contains the module, which is how Surge loads local module resources.
+ */
+export async function getSurgeBookmarkRoot(): Promise<string> {
+  try {
+    const cfg = loadConfig()
+    const configured = String(cfg.baseDir ?? "").trim()
+    const bookmarkName = String(cfg.baseBookmarkName ?? "").trim()
+    if (!configured || !bookmarkName) return ""
+
+    const fm = fmOrThrow()
+    if (typeof fm.bookmarkedPath !== "function") return ""
+    const resolved = await resolveBookmarkedPath(configured, bookmarkName)
+    return normalizePath(resolved ?? "")
+  } catch {
+    return ""
+  }
+}
+
+/**
+ * Guard every module write with the selected Surge bookmark boundary.
+ *
+ * Legacy private-resource cleanup remains an explicit maintenance action, but
+ * no new module or resource may be written there. This is the invariant that
+ * makes a successful import visible to Surge and to Files.
+ */
+export async function requireSurgeProfileDir(targetDir?: string): Promise<string> {
+  const root = await getSurgeBookmarkRoot()
+  if (!root) {
+    throw new Error("Select a valid configuration directory under iCloud Drive/Surge in Settings. Module writes stay within that directory.")
+  }
+  const target = String(targetDir ?? (await getModulesDirResolved())).trim()
+  if (!target || !isPathWithin(root, target)) {
+    throw new Error("The destination is outside the authorized iCloud Drive/Surge directory. The module was not written.")
+  }
+  return root
+}
+
+export function isPathWithin(root: string, target: string): boolean {
+  const base = normalizePath(root)
+  const value = normalizePath(target)
+  return !!base && !!value && (value === base || value.startsWith(`${base}/`))
+}
+
+async function exists(path: string): Promise<boolean> {
+  const fm = fmOrThrow()
+  if (typeof fm.exists === "function") return !!(await fm.exists(path))
+  if (typeof fm.existsSync === "function") return !!fm.existsSync(path)
+  return false
+}
+
+async function ensureDir(dir: string): Promise<void> {
+  const fm = fmOrThrow()
+  if (await exists(dir)) return
+  if (typeof fm.createDirectory === "function") {
+    await fm.createDirectory(dir, true)
+    return
+  }
+  if (typeof fm.createDirectorySync === "function") {
+    fm.createDirectorySync(dir, true)
+    return
+  }
+  throw new Error("FileManager.createDirectory is unavailable")
+}
+
+export async function ensureStorage(): Promise<void> {
+  const cfg = loadConfig()
+  if (cfg.baseDir) {
+    const root = await getSurgeBookmarkRoot()
+    if (!root) {
+      throw new Error("The bookmarked path is unavailable. Select the bookmarked folder again in Settings.")
+    }
+    // The selected bookmark is the security boundary. Module files are
+    // written into its real `Module` child; localized scripts use the sibling
+    // `Script` directory and other resources use the profile root. Never use
+    // Scripting's private documents directory as a fallback.
+    await ensureDir(root)
+    await ensureDir(surgeModuleDirectory(root))
+    return
+  }
+  throw new Error("Select a valid configuration directory under iCloud Drive/Surge in Settings. The script requires this directory to proceed.")
+}
+
+/**
+ * The single write path for module content.
+ *
+ * Keep the bookmark guard, backup, read-back verification, and failure
+ * rollback together so metadata edits, imports, and downloaded modules cannot
+ * silently diverge in their write semantics.
+ */
+export async function writeModuleFileVerified(path: string, content: string): Promise<void> {
+  const target = String(path ?? "").trim()
+  if (!target) throw new Error("The module destination path is missing")
+  await requireSurgeProfileDir(Path.dirname(target))
+  await ensureDir(Path.dirname(target))
+  await backupModulePath(target)
+  await replaceTextVerified(target, String(content ?? ""), "Module")
+}
+
+function extractNameFromPath(p: string): string {
+  const base = String(p).split("/").pop() ?? String(p)
+  return base.replace(/\.sgmodule$/i, "")
+}
+
+function parseTag(content: string, key: string): string | undefined {
+  const re = new RegExp(`^\\s*#!\\s*${key}\\s*=\\s*(.*)$`, "im")
+  const m = content.match(re)
+  return m?.[1]?.trim()
+}
+
+function parseIcon(content: string): string | undefined {
+  const lines = String(content ?? "").split(/\r?\n/g)
+  for (const raw of lines) {
+    const m = raw.match(/^\s*#\s*!?\s*icon\s*(?:=|\s)\s*(.+)$/i)
+    const value = m?.[1]?.trim()
+    if (value) return value
+  }
+  return undefined
+}
+
+export function getLinkPrefixes(): string[] {
+  const cfg = loadConfig()
+  const raw = String(cfg.linkPatternsText ?? "").split(/\r?\n/g)
+  const configured = raw
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+    // A hostname is not a metadata prefix. Ignore it instead of allowing a
+    // setting such as `http://script.hub` to shadow/erase real link markers.
+    .filter((s) => !/^[a-z][a-z0-9+.-]*:\/\//i.test(s))
+  return Array.from(new Set([...configured, ...BUILTIN_LINK_PREFIXES]))
+}
+
+export function formatLinkLine(prefix: string, url: string): string {
+  const p = String(prefix ?? "").trim()
+  const u = String(url ?? "").trim()
+  if (/^#SUBSCRIBED$/i.test(p)) return `${p} ${u}`
+  return `${p}${u}`
+}
+
+function parseLinkFromContent(content: string, prefixes: string[]): string {
+  const lines = String(content ?? "").split(/\r?\n/g)
+  for (const lineRaw of lines) {
+    const line = lineRaw.trimStart()
+    for (const prefix of prefixes) {
+      if (line.startsWith(prefix)) {
+        return line.slice(prefix.length).trim()
+      }
+    }
+  }
+  return ""
+}
+
+export function detectLinkPrefixFromContent(content: string, prefixes: string[]): string | undefined {
+  const lines = String(content ?? "").split(/\r?\n/g)
+  for (const lineRaw of lines) {
+    const line = lineRaw.trimStart()
+    const hit = prefixes.find((p) => line.startsWith(p))
+    if (hit) return hit
+  }
+  return undefined
+}
+
+async function isDirectory(path: string): Promise<boolean> {
+  const fm = fmOrThrow()
+  if (typeof fm.isDirectory === "function") return !!(await fm.isDirectory(path))
+  if (typeof fm.isDir === "function") return !!(await fm.isDir(path))
+  return false
+}
+
+async function removeTree(path: string): Promise<number> {
+  const fm = fmOrThrow()
+  if (!(await exists(path))) return 0
+
+  let removed = 0
+  if (await isDirectory(path) && typeof fm.readDirectory === "function") {
+    const entries = await fm.readDirectory(path)
+    if (Array.isArray(entries)) {
+      for (const entry of entries) {
+        const raw = String(entry)
+        const child = raw.includes("/") ? raw : Path.join(path, raw)
+        removed += await removeTree(child)
+      }
+    }
+  }
+
+  if (typeof fm.remove === "function") await fm.remove(path)
+  else if (typeof fm.removeSync === "function") fm.removeSync(path)
+  else throw new Error("FileManager.remove is unavailable")
+  return removed + 1
+}
+
+async function removeLegacyResourceDirectories(dir: string): Promise<number> {
+  const fm = fmOrThrow()
+  if (!(await exists(dir)) || !(await isDirectory(dir)) || typeof fm.readDirectory !== "function") return 0
+
+  const entries = await fm.readDirectory(dir)
+  if (!Array.isArray(entries)) return 0
+
+  let removedDirectories = 0
+  for (const entry of entries) {
+    const raw = String(entry)
+    const child = raw.includes("/") ? raw : Path.join(dir, raw)
+    if (raw === LEGACY_RESOURCE_DIR_NAME || child.split("/").pop() === LEGACY_RESOURCE_DIR_NAME) {
+      await removeTree(child)
+      removedDirectories += 1
+      continue
+    }
+    if (await isDirectory(child)) {
+      removedDirectories += await removeLegacyResourceDirectories(child)
+    }
+  }
+  return removedDirectories
+}
+
+/**
+ * Remove only resource directories created by the pre-4.2.6 fallback path.
+ * Module files, backups, metadata, and the selected Surge bookmark are kept.
+ */
+export async function cleanupLegacyPrivateResources(): Promise<{
+  removedDirectories: number
+  skipped: boolean
+  path: string
+}> {
+  const legacyModulesDir = Path.join(pickRootDir(), BASE_DIR_NAME, MODULES_DIR_NAME)
+  const surgeRoot = await getSurgeBookmarkRoot()
+  if (surgeRoot && (isPathWithin(legacyModulesDir, surgeRoot) || isPathWithin(surgeRoot, legacyModulesDir))) {
+    return { removedDirectories: 0, skipped: true, path: legacyModulesDir }
+  }
+
+  const removedDirectories = await removeLegacyResourceDirectories(legacyModulesDir)
+  return { removedDirectories, skipped: false, path: legacyModulesDir }
+}
+
+async function listModuleFilesRecursive(dir: string): Promise<string[]> {
+  const fm = fmOrThrow()
+  const list = await fm.readDirectory(dir)
+  if (!Array.isArray(list)) return []
+  const files: string[] = []
+  for (const entry of list) {
+    const raw = String(entry)
+    const full = raw.includes("/") ? raw : Path.join(dir, raw)
+    if (await isDirectory(full)) {
+      const sub = await listModuleFilesRecursive(full)
+      files.push(...sub)
+      continue
+    }
+    if (!full.toLowerCase().endsWith(".sgmodule")) continue
+    files.push(full)
+  }
+  return files
+}
+
+function parentDirectory(path: string): string {
+  const normalized = normalizePath(path)
+  const index = normalized.lastIndexOf("/")
+  return index > 0 ? normalized.slice(0, index) : ""
+}
+
+/**
+ * Read the selected Surge profile directory recursively. The optional
+ * `Module` child is included for files created during the short-lived folder
+ * migration, while the selected root remains the authoritative write target.
+ */
+async function moduleSearchDirectories(primaryDir?: string): Promise<string[]> {
+  const primary = String(primaryDir ?? (await getModulesDirResolved())).trim()
+  if (!primary) return []
+
+  const directories: string[] = [primary]
+  const add = (value: string) => {
+    const normalized = normalizePath(value)
+    if (!normalized) return
+    if (!directories.some((item) => normalizePath(item) === normalized)) directories.push(normalized)
+  }
+
+  const surgeRoot = await getSurgeBookmarkRoot()
+  if (surgeRoot) {
+    add(surgeRoot)
+    const rootName = normalizePath(surgeRoot).split("/").pop()?.toLowerCase() ?? ""
+    if (rootName === "module" || rootName === "modules") add(parentDirectory(surgeRoot))
+  }
+
+  return directories
+}
+
+async function listModuleFilesFromSearchDirectories(primaryDir?: string): Promise<string[]> {
+  const files: string[] = []
+  for (const directory of await moduleSearchDirectories(primaryDir)) {
+    // File Provider can briefly report a false `exists` while the same
+    // security-scoped directory is readable. Let the directory read decide;
+    // a genuinely absent directory is simply skipped after the catch.
+    try {
+      files.push(...await listModuleFilesRecursive(directory))
+    } catch {}
+  }
+  return Array.from(new Set(files))
+}
+
+export async function loadModules(
+  resolvedDir?: string,
+  includeContent = false,
+): Promise<ModuleInfo[]> {
+  // Callers that already resolved and authorized the bookmark can pass the
+  // directory through. This avoids repeating the security-scoped bookmark
+  // lookup during a single refresh.
+  if (!resolvedDir) await ensureStorage()
+  const dir = resolvedDir || await getModulesDirResolved()
+
+  const modules: ModuleInfo[] = []
+  const files = await listModuleFilesFromSearchDirectories(dir)
+  const prefixes = getLinkPrefixes()
+  for (const path of files) {
+    const item = await readModuleInfo(path, prefixes, includeContent)
+    if (item) modules.push(item)
+  }
+  return modules
+}
+
+export function moduleFilePath(moduleName: string, dir?: string): string {
+  const base = dir ?? getModulesDir()
+  return base ? Path.join(base, `${moduleName}.sgmodule`) : ""
+}
+
+async function readModuleInfo(
+  path: string,
+  prefixes = getLinkPrefixes(),
+  includeContent = false,
+): Promise<ModuleInfo | null> {
+  const fm = fmOrThrow()
+
+  const name = extractNameFromPath(path)
+  if (!name) return null
+
+  let text = ""
+  try {
+    text = await fm.readAsString(path)
+  } catch {
+    text = ""
+  }
+
+  const link = parseLinkFromContent(text, prefixes)
+  const sourceURL = parseTag(text, "source-url")
+  const localTag = parseTag(text, "local")
+  const localScriptsTag = parseTag(text, "local-scripts")
+  const hasLocalScripts =
+    localScriptsTag != null &&
+    String(localScriptsTag).trim() !== "" &&
+    !["0", "false", "no"].includes(String(localScriptsTag).trim().toLowerCase())
+  const localResourcesTag = parseTag(text, "local-resources")
+  const hasLocalResources =
+    localResourcesTag != null &&
+    String(localResourcesTag).trim() !== "" &&
+    !["0", "false", "no"].includes(String(localResourcesTag).trim().toLowerCase())
+  const hasLocalTag =
+    localTag != null &&
+    String(localTag).trim() !== "" &&
+    !["0", "false", "no"].includes(String(localTag).trim().toLowerCase())
+  const hasLocalResourceRefs = /(?:^|[\\/])(?:\.scripting-resources|Scripts)(?:[\\/]|$)/i.test(text)
+  const isLocal = hasLocalTag || !link
+  const category = parseTag(text, "category") ?? parseTag(text, "cagegory") ?? undefined
+  const surgeName = parseTag(text, "name") ?? undefined
+  const icon = parseTag(text, "icon") ?? parseIcon(text)
+  return {
+    name,
+    link,
+    sourceURL,
+    surgeName,
+    category,
+    icon,
+    filePath: path,
+    isLocal,
+    localScripts: hasLocalScripts,
+    localResources: hasLocalResources || hasLocalScripts || hasLocalResourceRefs,
+    ...(includeContent ? { content: text } : {}),
+  }
+}
+
+/**
+ * Read one known destination without recursively walking the whole bookmark.
+ * Script-Hub imports always target the selected bookmark root, and a full
+ * iCloud directory walk can block an Intent for a long time.
+ */
+export async function loadModuleAtPath(path: string): Promise<ModuleInfo | null> {
+  if (!String(path ?? "").trim()) return null
+  if (!(await exists(path))) return null
+  return readModuleInfo(path)
+}
+
+function resolveModulePath(target: ModuleInfo | string): string {
+  if (typeof target === "string") return moduleFilePath(target)
+  return target.filePath ?? moduleFilePath(target.name)
+}
+
+export async function moveModuleFile(
+  target: ModuleInfo | string,
+  nextDir?: string,
+  nextName?: string
+): Promise<string> {
+  const fm = fmOrThrow()
+  const from = resolveModulePath(target)
+  const name = String(nextName ?? (typeof target === "string" ? target : target.name)).trim()
+  const baseDir = nextDir ?? Path.dirname(from)
+  const to = moduleFilePath(name, baseDir)
+
+  await requireSurgeProfileDir(Path.dirname(from))
+  await requireSurgeProfileDir(baseDir)
+
+  if (normalizePath(from) === normalizePath(to)) return to
+  await ensureDir(baseDir)
+  if (!(await exists(from))) return to
+  if (await exists(to)) throw new Error(`A module already exists at the destination and was kept: ${to}`)
+
+  if (typeof fm.rename === "function") {
+    try {
+      await fm.rename(from, to)
+      if (!(await exists(to))) throw new Error(`Could not read the destination file after moving the module: ${to}`)
+      return to
+    } catch (error) {
+      // A provider may complete the rename and then fail its acknowledgement.
+      // Only attempt the exact inverse when the source is gone and the new
+      // file is visible; never remove either side as a recovery shortcut.
+      try {
+        if (!(await exists(from)) && await exists(to)) await fm.rename(to, from)
+      } catch (rollbackError) {
+        throw new Error(`Could not move the module: ${String((error as any)?.message ?? error)}. Could not roll back the move: ${String((rollbackError as any)?.message ?? rollbackError)}`)
+      }
+      throw error
+    }
+  }
+  if (typeof fm.renameSync === "function") {
+    try {
+      fm.renameSync(from, to)
+      if (!(await exists(to))) throw new Error(`Could not read the destination file after moving the module: ${to}`)
+      return to
+    } catch (error) {
+      try {
+        if (!(await exists(from)) && await exists(to)) fm.renameSync(to, from)
+      } catch (rollbackError) {
+        throw new Error(`Could not move the module: ${String((error as any)?.message ?? error)}. Could not roll back the move: ${String((rollbackError as any)?.message ?? rollbackError)}`)
+      }
+      throw error
+    }
+  }
+  throw new Error("FileManager.rename is unavailable")
+}
+
+export async function detectLinkPrefix(target: ModuleInfo | string): Promise<string | undefined> {
+  const fm = fmOrThrow()
+  const path = resolveModulePath(target)
+  if (!(await exists(path))) return undefined
+  const raw = await fm.readAsString(path)
+  return detectLinkPrefixFromContent(String(raw ?? ""), getLinkPrefixes())
+}
+
+export async function removeModuleFile(target: ModuleInfo | string): Promise<void> {
+  const fm = fmOrThrow()
+  const path = resolveModulePath(target)
+  await requireSurgeProfileDir(Path.dirname(path))
+  if (!(await exists(path))) return
+  if (typeof fm.remove === "function") {
+    await fm.remove(path)
+    return
+  }
+  if (typeof fm.removeSync === "function") {
+    fm.removeSync(path)
+    return
+  }
+  throw new Error("FileManager.remove is unavailable")
+}
+
+export async function renameModuleFile(oldTarget: ModuleInfo | string, newName: string): Promise<void> {
+  const fm = fmOrThrow()
+  const from = resolveModulePath(oldTarget)
+  const to = Path.join(Path.dirname(from), `${newName}.sgmodule`)
+  await requireSurgeProfileDir(Path.dirname(from))
+  if (!(await exists(from))) return
+  if (normalizePath(from) === normalizePath(to)) return
+  if (await exists(to)) throw new Error(`A module already exists at the destination and was kept: ${to}`)
+  if (typeof fm.rename === "function") {
+    await fm.rename(from, to)
+    if (!(await exists(to))) throw new Error(`Could not read the destination file after renaming the module: ${to}`)
+    return
+  }
+  if (typeof fm.renameSync === "function") {
+    fm.renameSync(from, to)
+    if (!(await exists(to))) throw new Error(`Could not read the destination file after renaming the module: ${to}`)
+    return
+  }
+  throw new Error("FileManager.rename is unavailable")
+}
+
+function upsertTag(content: string, key: string, value?: string): string {
+  const trimmed = String(value ?? "").trim()
+  const line = `#!${key}=${trimmed}`
+  const re = new RegExp(`^\\s*#!\\s*${key}\\s*=.*$`, "im")
+  const lines = String(content ?? "").split(/\r?\n/g)
+  let inserted = false
+  const next: string[] = []
+  for (const item of lines) {
+    if (re.test(item)) {
+      if (trimmed && !inserted) {
+        next.push(line)
+        inserted = true
+      }
+      continue
+    }
+    next.push(item)
+  }
+  if (trimmed && !inserted) next.unshift(line)
+  return next.join("\n")
+}
+
+function upsertLink(content: string, prefixes: string[], value?: string): string {
+  const trimmed = String(value ?? "").trim()
+  if (!trimmed) return content
+  const lines = String(content ?? "").split(/\r?\n/g)
+  let matchedPrefix: string | undefined
+  const filtered = lines.filter((line) => {
+    const t = line.trimStart()
+    const hit = prefixes.find((p) => t.startsWith(p))
+    if (hit && !matchedPrefix) matchedPrefix = hit
+    return !hit
+  })
+  const prefix = matchedPrefix ?? prefixes[0] ?? "#url="
+  return `${formatLinkLine(prefix, trimmed)}\n${filtered.join("\n")}`
+}
+
+export async function updateModuleMetadata(
+  target: ModuleInfo | string,
+  info: {
+    link?: string
+    sourceURL?: string
+    category?: string
+    icon?: string
+    local?: boolean
+    localScripts?: boolean
+  }
+) {
+  const fm = fmOrThrow()
+  const path = resolveModulePath(target)
+  if (!(await exists(path))) return
+  await requireSurgeProfileDir(Path.dirname(path))
+  const raw = await fm.readAsString(path)
+  let content = String(raw ?? "")
+  content = upsertLink(content, getLinkPrefixes(), info.link)
+  if (Object.prototype.hasOwnProperty.call(info, "sourceURL")) {
+    content = upsertTag(content, "source-url", info.sourceURL)
+  }
+  // Omitted/undefined category means “keep the category already persisted in
+  // the module”. Pass an empty string when the caller intentionally clears it.
+  if (Object.prototype.hasOwnProperty.call(info, "category") && info.category !== undefined) {
+    content = upsertTag(content, "category", info.category)
+  }
+  if (info.icon !== undefined) {
+    content = upsertTag(content, "icon", info.icon)
+  }
+  if (info.local !== undefined) {
+    content = upsertTag(content, "local", info.local ? "true" : "")
+  }
+  if (info.localScripts !== undefined) {
+    content = upsertTag(content, "local-scripts", info.localScripts ? "true" : "")
+  }
+  await writeModuleFileVerified(path, content)
+}
+
+export async function listDirectSubDirs(baseDir?: string): Promise<string[]> {
+  const fm = fmOrThrow()
+  const root = await getModulesDirResolved(baseDir)
+  if (!root) return []
+  const list = await fm.readDirectory(root)
+  if (!Array.isArray(list)) return []
+  const dirs: string[] = []
+  for (const entry of list) {
+    const raw = String(entry)
+    const full = raw.includes("/") ? raw : Path.join(root, raw)
+    const name = raw.includes("/") ? raw.split("/").pop() ?? raw : raw
+    if (!name || name.startsWith(".")) continue
+    if (name === "__pycache__" || name === "__pypackages__") continue
+    if (await isDirectory(full)) dirs.push(full)
+  }
+  return dirs
+}
+
+export async function loadCategoriesFromModules(baseDir?: string): Promise<{
+  categories: string[]
+  scanned: number
+  added: number
+}> {
+  const fm = fmOrThrow()
+  const files = await listModuleFilesFromSearchDirectories(await getModulesDirResolved(baseDir))
+  const set = new Set<string>()
+  for (const path of files) {
+    let text = ""
+    try {
+      text = await fm.readAsString(path)
+    } catch {
+      text = ""
+    }
+    const cat = parseTag(text, "category") ?? parseTag(text, "cagegory")
+    if (cat) set.add(cat)
+  }
+  const categories = Array.from(set)
+  return { categories, scanned: files.length, added: categories.length }
+}
+
+export async function renameCategoryInModules(oldName: string, newName: string, baseDir?: string): Promise<void> {
+  const fm = fmOrThrow()
+  const files = await listModuleFilesFromSearchDirectories(await getModulesDirResolved(baseDir))
+  const pending: { path: string; content: string; backupPath: string | null }[] = []
+  for (const path of files) {
+    let text = ""
+    try {
+      text = await fm.readAsString(path)
+    } catch {
+      continue
+    }
+    const cat = parseTag(text, "category")
+    if (!cat || cat !== oldName) continue
+    const content = upsertTag(text, "category", newName)
+    // Create all recovery points before changing any module, so a File
+    // Provider failure halfway through a category rename cannot leave a
+    // partially renamed set.
+    const backupPath = await backupModulePath(path)
+    if (!backupPath) throw new Error(`A module disappeared before the category rename. Batch writing stopped: ${path}`)
+    pending.push({ path, content, backupPath })
+  }
+
+  const changed: typeof pending = []
+  try {
+    for (const item of pending) {
+      await writeModuleFileVerified(item.path, item.content)
+      changed.push(item)
+    }
+  } catch (error) {
+    const failures: string[] = []
+    for (const item of [...changed].reverse()) {
+      if (!item.backupPath) continue
+      try {
+        await restoreModuleBackup(item.path, item.backupPath)
+      } catch (rollbackError) {
+        failures.push(`${item.path}: ${String((rollbackError as any)?.message ?? rollbackError)}`)
+      }
+    }
+    if (failures.length) {
+      throw new Error(`Could not rename the category: ${String((error as any)?.message ?? error)}. Batch rollback failed: ${failures.join(". ")}`)
+    }
+    throw error
+  }
+}
+
+export async function countModulesByCategory(baseDir?: string): Promise<Record<string, number>> {
+  const fm = fmOrThrow()
+  const files = await listModuleFilesFromSearchDirectories(await getModulesDirResolved(baseDir))
+  const counts: Record<string, number> = {}
+  for (const path of files) {
+    let text = ""
+    try {
+      text = await fm.readAsString(path)
+    } catch {
+      text = ""
+    }
+    const cat = parseTag(text, "category") ?? parseTag(text, "cagegory") ?? ""
+    if (!cat) continue
+    counts[cat] = (counts[cat] ?? 0) + 1
+  }
+  return counts
+}
+
+export function sortModules(list: ModuleInfo[]): ModuleInfo[] {
+  return [...list].sort((a, b) => {
+    const ca = String(a.category ?? "")
+    const cb = String(b.category ?? "")
+    if (ca !== cb) return ca.localeCompare(cb)
+    return a.name.localeCompare(b.name)
+  })
+}

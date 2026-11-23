@@ -1,0 +1,353 @@
+import { Path } from "scripting"
+
+import { loadConfig, saveConfig, type AppConfig } from "./config"
+import {
+  detectLinkPrefix,
+  formatLinkLine,
+  getLinkPrefixes,
+  getModulesDirResolved,
+  loadModules,
+  moduleFilePath,
+  requireSurgeProfileDir,
+  updateModuleMetadata,
+  writeModuleFileVerified,
+  type ModuleInfo,
+} from "./storage"
+import { writeTextVerified } from "./verified_write"
+
+const SYNC_DIR_NAME = "SurgeModulesManager"
+const METADATA_FILE_NAME = "metadata.json"
+const METADATA_VERSION = 1
+
+type MetadataModule = {
+  name: string
+  surgeName?: string
+  link: string
+  sourceURL?: string
+  linkPrefix?: string
+  category?: string
+  icon?: string
+  relativeDir?: string
+  isLocal?: boolean
+}
+
+type MetadataFile = {
+  version: number
+  updatedAt: string
+  modules: MetadataModule[]
+  settings?: {
+    categories?: string[]
+    linkPatternsText?: string
+  }
+}
+
+export type MetadataExportResult = {
+  path: string
+  count: number
+}
+
+export type MetadataImportResult = {
+  path: string
+  scanned: number
+  created: number
+  updated: number
+  skipped: number
+  categoriesAdded: number
+  config: AppConfig
+}
+
+function fmOrThrow(): any {
+  const fm = (globalThis as any).FileManager
+  if (!fm) throw new Error("FileManager is unavailable")
+  return fm
+}
+
+async function exists(path: string): Promise<boolean> {
+  const fm = fmOrThrow()
+  if (typeof fm.exists === "function") return !!(await fm.exists(path))
+  if (typeof fm.existsSync === "function") return !!fm.existsSync(path)
+  return false
+}
+
+async function ensureDir(path: string): Promise<void> {
+  const fm = fmOrThrow()
+  if (await exists(path)) return
+  if (typeof fm.createDirectory === "function") {
+    await fm.createDirectory(path, true)
+    return
+  }
+  if (typeof fm.createDirectorySync === "function") {
+    fm.createDirectorySync(path, true)
+    return
+  }
+  throw new Error("FileManager.createDirectory is unavailable")
+}
+
+function dirname(path: string): string {
+  const idx = String(path ?? "").lastIndexOf("/")
+  return idx > 0 ? path.slice(0, idx) : ""
+}
+
+function relativeDirOf(module: ModuleInfo, baseDir: string): string {
+  const filePath = String(module.filePath ?? "")
+  if (!filePath) return ""
+  const parent = dirname(filePath)
+  if (!baseDir || parent === baseDir) return ""
+  return parent.replace(baseDir, "").replace(/^\/+/, "")
+}
+
+function normalizeRelativeDir(dir?: string): string {
+  return String(dir ?? "")
+    .trim()
+    .replace(/^\/+/, "")
+    .replace(/\/+$/, "")
+}
+
+function normalizeCategories(list: string[]): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const raw of list ?? []) {
+    const value = String(raw ?? "").trim()
+    if (!value || seen.has(value)) continue
+    seen.add(value)
+    out.push(value)
+  }
+  return out
+}
+
+function moduleKey(name: string, relativeDir?: string): string {
+  return `${normalizeRelativeDir(relativeDir)}\u0000${String(name ?? "").trim()}`
+}
+
+export function iCloudMetadataAvailable(): boolean {
+  const fm = (globalThis as any).FileManager
+  return !!(fm?.isiCloudEnabled && fm?.iCloudDocumentsDirectory)
+}
+
+export async function iCloudMetadataPath(): Promise<string> {
+  const fm = fmOrThrow()
+  if (!fm.isiCloudEnabled || !fm.iCloudDocumentsDirectory) {
+    throw new Error("iCloud is unavailable. Check that you are signed in and Scripting has iCloud access.")
+  }
+  const dir = Path.join(fm.iCloudDocumentsDirectory, SYNC_DIR_NAME)
+  await ensureDir(dir)
+  return Path.join(dir, METADATA_FILE_NAME)
+}
+
+async function buildMetadata(): Promise<MetadataFile> {
+  const cfg = loadConfig()
+  const baseDir = await getModulesDirResolved()
+  const modules = await loadModules()
+  const items: MetadataModule[] = []
+
+  for (const module of modules) {
+    if (!module.link) continue
+    items.push({
+      name: module.name,
+      surgeName: module.surgeName,
+      link: module.link,
+      sourceURL: module.sourceURL,
+      linkPrefix: await detectLinkPrefix(module),
+      category: module.category,
+      icon: module.icon,
+      relativeDir: relativeDirOf(module, baseDir),
+      isLocal: !!module.isLocal,
+    })
+  }
+
+  return {
+    version: METADATA_VERSION,
+    updatedAt: new Date().toISOString(),
+    modules: items,
+    settings: {
+      categories: cfg.categories ?? [],
+      linkPatternsText: cfg.linkPatternsText,
+    },
+  }
+}
+
+export async function exportMetadataToICloud(): Promise<MetadataExportResult> {
+  const fm = fmOrThrow()
+  if (!fm || (typeof fm.writeAsString !== "function" && typeof fm.writeAsStringSync !== "function")) {
+    throw new Error("FileManager.writeAsString is unavailable")
+  }
+  const path = await iCloudMetadataPath()
+  const metadata = await buildMetadata()
+  await writeTextVerified(path, JSON.stringify(metadata, null, 2), "iCloud metadata")
+  return { path, count: metadata.modules.length }
+}
+
+export async function exportMetadataWithDocumentPicker(): Promise<MetadataExportResult> {
+  const picker = (globalThis as any).DocumentPicker
+  const Data = (globalThis as any).Data
+  if (!picker?.exportFiles) throw new Error("DocumentPicker.exportFiles is unavailable")
+  if (!Data?.fromString) throw new Error("Data.fromString is unavailable")
+
+  const metadata = await buildMetadata()
+  const data = Data.fromString(JSON.stringify(metadata, null, 2))
+  if (!data) throw new Error("Could not encode metadata")
+
+  const paths = await picker.exportFiles({
+    files: [
+      {
+        data,
+        name: METADATA_FILE_NAME,
+      },
+    ],
+  })
+  const path = Array.isArray(paths) ? String(paths[0] ?? "") : ""
+  if (!path) throw new Error("No export location selected")
+  return { path, count: metadata.modules.length }
+}
+
+export async function removeICloudMetadataFile(): Promise<boolean> {
+  if (!iCloudMetadataAvailable()) return false
+  const fm = fmOrThrow()
+  const path = Path.join(fm.iCloudDocumentsDirectory, SYNC_DIR_NAME, METADATA_FILE_NAME)
+  if (!(await exists(path))) return false
+  if (typeof fm.remove === "function") {
+    await fm.remove(path)
+    return true
+  }
+  if (typeof fm.removeSync === "function") {
+    fm.removeSync(path)
+    return true
+  }
+  throw new Error("FileManager.remove is unavailable")
+}
+
+function parseMetadata(raw: string): MetadataFile {
+  const parsed = JSON.parse(String(raw ?? ""))
+  if (!parsed || typeof parsed !== "object") throw new Error("Invalid metadata format")
+  const modules = Array.isArray(parsed.modules) ? parsed.modules : []
+  return {
+    version: Number(parsed.version ?? 0),
+    updatedAt: String(parsed.updatedAt ?? ""),
+    modules: modules
+      .map((item: any) => ({
+        name: String(item?.name ?? "").trim(),
+        surgeName: String(item?.surgeName ?? "").trim() || undefined,
+        link: String(item?.link ?? "").trim(),
+        sourceURL: String(item?.sourceURL ?? "").trim() || undefined,
+        linkPrefix: String(item?.linkPrefix ?? "") || undefined,
+        category: String(item?.category ?? "").trim() || undefined,
+        icon: String(item?.icon ?? "").trim() || undefined,
+        relativeDir: normalizeRelativeDir(item?.relativeDir),
+        isLocal: !!item?.isLocal,
+      }))
+      .filter((item: MetadataModule) => item.name && item.link),
+    settings: parsed.settings && typeof parsed.settings === "object" ? parsed.settings : undefined,
+  }
+}
+
+function placeholderContent(item: MetadataModule): string {
+  const lines: string[] = []
+  const prefix = item.linkPrefix || getLinkPrefixes()[0] || "#!url="
+  lines.push(formatLinkLine(prefix, item.link))
+  if (item.category) lines.push(`#!category=${item.category}`)
+  if (item.sourceURL) lines.push(`#!source-url=${item.sourceURL}`)
+  if (item.icon) lines.push(`#!icon=${item.icon}`)
+  if (item.surgeName) lines.push(`#!name=${item.surgeName}`)
+  lines.push("# Generated by Surge Module Manager metadata import.")
+  return lines.join("\n")
+}
+
+async function savePlaceholderModule(item: MetadataModule, targetDir: string): Promise<void> {
+  const fm = fmOrThrow()
+  if (!fm || (typeof fm.writeAsString !== "function" && typeof fm.writeAsStringSync !== "function")) {
+    throw new Error("FileManager.writeAsString is unavailable")
+  }
+  await requireSurgeProfileDir(targetDir)
+  await ensureDir(targetDir)
+  await writeModuleFileVerified(moduleFilePath(item.name, targetDir), placeholderContent(item))
+}
+
+export async function importMetadataFromFile(
+  path: string,
+  currentCfg: AppConfig = loadConfig()
+): Promise<MetadataImportResult> {
+  const fm = fmOrThrow()
+  if (!fm?.readAsString) throw new Error("FileManager.readAsString is unavailable")
+
+  const filePath = String(path ?? "").trim()
+  if (!filePath) throw new Error("No metadata file selected")
+  if (!(await exists(filePath))) throw new Error("The metadata file is missing or inaccessible")
+
+  const raw = await fm.readAsString(filePath)
+  const metadata = parseMetadata(raw)
+  const baseDir = await getModulesDirResolved()
+  const currentModules = await loadModules()
+  const byPath = new Map<string, ModuleInfo>()
+  const byLink = new Map<string, ModuleInfo>()
+
+  for (const module of currentModules) {
+    byPath.set(moduleKey(module.name, relativeDirOf(module, baseDir)), module)
+    if (module.link) byLink.set(module.link, module)
+  }
+
+  let created = 0
+  let updated = 0
+  let skipped = 0
+
+  for (const item of metadata.modules) {
+    const relativeDir = normalizeRelativeDir(item.relativeDir)
+    const targetDir = relativeDir ? Path.join(baseDir, relativeDir) : baseDir
+    const existing = byPath.get(moduleKey(item.name, relativeDir))
+    if (existing) {
+      await updateModuleMetadata(existing, {
+        link: item.link,
+        ...(item.sourceURL ? { sourceURL: item.sourceURL } : {}),
+        category: item.category,
+        icon: item.icon,
+        local: false,
+      })
+      updated += 1
+      continue
+    }
+
+    if (byLink.has(item.link)) {
+      skipped += 1
+      continue
+    }
+
+    await savePlaceholderModule(item, targetDir)
+    created += 1
+  }
+
+  const importedCategories = normalizeCategories([
+    ...(metadata.settings?.categories ?? []),
+    ...metadata.modules.map((item) => item.category ?? ""),
+  ])
+  const existingCategories = new Set(currentCfg.categories ?? [])
+  const categoriesToAdd = importedCategories.filter((item) => !existingCategories.has(item))
+  const nextCfg: AppConfig = {
+    ...currentCfg,
+    categories: normalizeCategories([...(currentCfg.categories ?? []), ...categoriesToAdd]),
+    linkPatternsText: String(metadata.settings?.linkPatternsText ?? currentCfg.linkPatternsText),
+  }
+  saveConfig(nextCfg)
+
+  return {
+    path: filePath,
+    scanned: metadata.modules.length,
+    created,
+    updated,
+    skipped,
+    categoriesAdded: categoriesToAdd.length,
+    config: nextCfg,
+  }
+}
+
+export async function importMetadataFromICloud(currentCfg: AppConfig = loadConfig()): Promise<MetadataImportResult> {
+  const path = await iCloudMetadataPath()
+  return importMetadataFromFile(path, currentCfg)
+}
+
+export async function autoExportMetadataToICloud(cfg: AppConfig = loadConfig()): Promise<void> {
+  if (!cfg.iCloudMetadataSync) return
+  try {
+    await exportMetadataToICloud()
+  } catch (e) {
+    console.warn("[Surge Module Manager] iCloud metadata auto export failed", e)
+  }
+}

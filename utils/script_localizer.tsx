@@ -1,0 +1,814 @@
+import { Path } from "scripting"
+
+import { withTimeout } from "./async"
+import {
+  extractLocalModuleResourceReferences,
+  extractRemoteModuleResourceReferences,
+  relativeProfilePath,
+  rewriteModuleResourceReferences,
+  rewriteRemoteModuleResources,
+  type RemoteModuleResourceReference,
+} from "./script_localizer_core"
+import type { ModuleInfo } from "./storage"
+import { replaceTextVerified, restoreTextSnapshot, snapshotText } from "./verified_write"
+
+const RESOURCE_FETCH_TIMEOUT_MS = 30 * 1000
+const RESOURCE_FILE_OPERATION_TIMEOUT_MS = 15 * 1000
+const MAX_RESOURCE_CHARS = 20 * 1024 * 1024
+
+export type ScriptLocalizationResult = {
+  content: string
+  localizedCount: number
+  scriptCount: number
+  ruleSetCount: number
+  domainSetCount: number
+  includeCount: number
+  resourceURLs: string[]
+  rollback: () => Promise<void>
+}
+
+type FileChange = {
+  path: string
+  existed: boolean
+  previous?: string
+}
+
+function fmOrThrow(): any {
+  const fm = (globalThis as any).FileManager
+  if (!fm) throw new Error("FileManager is unavailable")
+  return fm
+}
+
+function safeFileName(value: string, fallback: string): string {
+  // Preserve the remote basename (including case and Unicode) so the file in
+  // Surge/Files is the same name the provider exposes. Only remove characters
+  // that cannot be used safely as a single path segment.
+  const fixed = String(value ?? "")
+    .replace(/[\\/\u0000-\u001f]/g, "_")
+    .replace(/^[.]+$/, "")
+    .slice(0, 180)
+  return fixed || fallback
+}
+
+// These helpers are intentionally migration-only. The hash is never written
+// to a new resource filename; it only lets us locate files created by v4.2.14
+// and earlier in the old `Scripts/<module-hash>/...` cache.
+function shortHash(value: string): string {
+  let hash = 0x811c9dc5
+  for (const char of String(value ?? "")) {
+    hash ^= char.charCodeAt(0)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0").slice(0, 8)
+}
+
+function legacySafeSegment(value: string, fallback: string): string {
+  const fixed = String(value ?? "")
+    .replace(/[^A-Za-z0-9._-]+/g, "_")
+    .replace(/^\.+/, "")
+    .replace(/_+/g, "_")
+    .replace(/^[_-]+|[_-]+$/g, "")
+    .slice(0, 80)
+  return fixed || fallback
+}
+
+function kindDirectory(kind: RemoteModuleResourceReference["kind"]): string {
+  return kind === "script" ? "scripts" : kind === "include" ? "includes" : "rulesets"
+}
+
+/**
+ * Canonical visible resource directory inside the selected Surge profile.
+ * JavaScript resources live in `Surge/Script`; rule sets and includes keep
+ * their existing root-level layout. Module files themselves are never moved.
+ */
+function resourceDirectory(kind: RemoteModuleResourceReference["kind"]): string {
+  return kind === "script" ? "Script" : ""
+}
+
+function resourcePath(
+  resourceRoot: string,
+  fileName: string,
+  kind: RemoteModuleResourceReference["kind"],
+): string {
+  const directory = resourceDirectory(kind)
+  return directory
+    ? Path.join(resourceRoot, directory, fileName)
+    : Path.join(resourceRoot, fileName)
+}
+
+function resourceFileName(url: string, kind: RemoteModuleResourceReference["kind"]): string {
+  const fallback = kind === "script" ? "script.js" : kind === "include" ? "include.conf" : "rules.list"
+  let last = fallback
+  try {
+    const parsed = new URL(url)
+    const path = parsed.pathname.split("/").pop() ?? ""
+    if (path) last = decodeURIComponent(path)
+  } catch {}
+  return safeFileName(last, fallback)
+}
+
+function legacyResourceFileName(url: string, kind: RemoteModuleResourceReference["kind"]): string {
+  const fallback = kind === "script" ? "script.js" : kind === "include" ? "include.conf" : "rules.list"
+  let last = fallback
+  try {
+    const parsed = new URL(url)
+    const path = parsed.pathname.split("/").pop() ?? ""
+    if (path) last = decodeURIComponent(path)
+  } catch {}
+  const defaultExtension = kind === "script" ? ".js" : kind === "include" ? ".conf" : ".list"
+  const extension = last.match(/\.[A-Za-z0-9]{1,8}$/)?.[0] ?? defaultExtension
+  const stem = last.replace(/\.[A-Za-z0-9]{1,8}$/, "") || kind
+  return `${legacySafeSegment(stem, kind)}-${shortHash(`${kind}:${url}`)}${extension.toLowerCase()}`
+}
+
+function pathBaseName(path: string): string {
+  const normalized = String(path ?? "").replace(/\\/g, "/").replace(/\/+$/, "")
+  return normalized.split("/").pop() ?? ""
+}
+
+function inferResourceRoot(modulePath: string): string {
+  const normalized = String(modulePath ?? "").replace(/\\/g, "/").replace(/\/+$/, "")
+  const parts = normalized.split("/")
+  const moduleIndex = parts.map((item) => item.toLowerCase()).lastIndexOf("module")
+  const modulesIndex = parts.map((item) => item.toLowerCase()).lastIndexOf("modules")
+  const index = Math.max(moduleIndex, modulesIndex)
+  if (index > 0) return parts.slice(0, index).join("/") || "/"
+  return Path.dirname(Path.dirname(modulePath))
+}
+
+function legacyResourceDirectories(
+  resourceRoot: string,
+  modulePath: string,
+  moduleName: string,
+  kind: RemoteModuleResourceReference["kind"],
+): string[] {
+  const moduleDirectory = `${legacySafeSegment(moduleName, "module")}-${shortHash(moduleName)}`
+  const kindDir = kindDirectory(kind)
+  const moduleDir = Path.dirname(modulePath)
+  // v4.2.14 and earlier used both the visible `Scripts` tree and the hidden
+  // `.scripting-resources` tree, depending on which build wrote the module.
+  // Both are still inside the user's selected Surge bookmark, so they are
+  // safe migration sources; neither is a fallback to Scripting's private
+  // documents directory.
+  return [
+    Path.join(resourceRoot, "Scripts", moduleDirectory, kindDir),
+    Path.join(resourceRoot, ".scripting-resources", moduleDirectory, kindDir),
+    Path.join(moduleDir, "Scripts", moduleDirectory, kindDir),
+    Path.join(moduleDir, ".scripting-resources", moduleDirectory, kindDir),
+    Path.join(moduleDir, "Scripts", kindDir),
+    Path.join(moduleDir, ".scripting-resources", kindDir),
+  ]
+}
+
+function migratedResourceFileName(
+  path: string,
+  kind: RemoteModuleResourceReference["kind"],
+  referenceValue?: string,
+): string {
+  // The module's current reference is authoritative. In particular,
+  // a hash-suffixed resource name is still a real resource name, not a suffix
+  // that may be stripped: Surge must see the exact same basename in the root.
+  const referencedBase = pathBaseName(referenceValue ?? "")
+  if (referencedBase && /\.[A-Za-z0-9]{1,16}$/.test(referencedBase)) {
+    return safeFileName(referencedBase, resourceFileName(path, kind))
+  }
+  const base = pathBaseName(path)
+  if (base && /\.[A-Za-z0-9]{1,16}$/.test(base)) {
+    return safeFileName(base, resourceFileName(path, kind))
+  }
+  return resourceFileName(path, kind)
+}
+
+function metadataURLValues(content: string, key: string): string[] {
+  const values: string[] = []
+  const pattern = new RegExp(`^\\s*#!\\s*${key}\\s*=\\s*(\\S.*?)\\s*$`, "im")
+  for (const line of String(content ?? "").split(/\r?\n/g)) {
+    const match = pattern.exec(line)
+    if (!match) continue
+    const value = match[1].trim().replace(/^['"]|['"]$/g, "")
+    if (value) values.push(value)
+  }
+  return values
+}
+
+/**
+ * Recover the source module behind a Script-Hub-style `/_start_/_end_`
+ * wrapper. A localized module may only retain a local filename in
+ * `script-path`; the source module is still enough to recover a missing file
+ * without hard-coding a particular third-party script.
+ */
+function moduleSourceCandidates(content: string): string[] {
+  const candidates: string[] = []
+  const add = (value: string) => {
+    let fixed = String(value ?? "").trim()
+    if (!fixed) return
+    try { fixed = decodeURIComponent(fixed) } catch {}
+    if (!/^https?:\/\//i.test(fixed) || candidates.includes(fixed)) return
+    candidates.push(fixed)
+  }
+
+  for (const value of [
+    ...metadataURLValues(content, "source-url"),
+    ...metadataURLValues(content, "url"),
+  ]) {
+    const endMarker = "/_end_/"
+    const endIndex = value.indexOf(endMarker)
+    if (endIndex >= 0) {
+      let source = value.slice(0, endIndex)
+      const startMarker = "/_start_/"
+      const startIndex = source.lastIndexOf(startMarker)
+      if (startIndex >= 0) source = source.slice(startIndex + startMarker.length)
+      // Prefer the unwrapped upstream module so a converter endpoint cannot
+      // stall recovery before the actual source is tried.
+      add(source)
+    }
+    add(value)
+  }
+  return candidates
+}
+
+function resourceStem(value: string): string {
+  return pathBaseName(value)
+    .toLowerCase()
+    .replace(/\.[a-z0-9]{1,16}$/i, "")
+    .replace(/-[0-9a-f]{8,}$/i, "")
+}
+
+function chooseRecoveryReference(
+  localReference: RemoteModuleResourceReference,
+  remoteReferences: RemoteModuleResourceReference[],
+): RemoteModuleResourceReference | undefined {
+  const candidates = remoteReferences.filter((reference) => reference.kind === localReference.kind)
+  if (!candidates.length) return undefined
+  const localBase = pathBaseName(localReference.value).toLowerCase()
+  const localStem = resourceStem(localReference.value)
+  const ranked = [...candidates].sort((left, right) => {
+    const leftBase = pathBaseName(left.value).toLowerCase()
+    const rightBase = pathBaseName(right.value).toLowerCase()
+    const leftScore = leftBase === localBase
+      ? 3
+      : resourceStem(left.value) === localStem
+        ? 2
+        : candidates.length === 1 ? 1 : 0
+    const rightScore = rightBase === localBase
+      ? 3
+      : resourceStem(right.value) === localStem
+        ? 2
+        : candidates.length === 1 ? 1 : 0
+    return rightScore - leftScore
+  })
+  const best = ranked[0]
+  if (!best) return undefined
+  const bestBase = pathBaseName(best.value).toLowerCase()
+  const bestScore = bestBase === localBase
+    ? 3
+    : resourceStem(best.value) === localStem
+      ? 2
+      : candidates.length === 1 ? 1 : 0
+  return bestScore > 0 ? best : undefined
+}
+
+async function exists(path: string): Promise<boolean> {
+  const fm = fmOrThrow()
+  if (typeof fm.exists === "function") return !!(await fm.exists(path))
+  if (typeof fm.existsSync === "function") return !!fm.existsSync(path)
+  return false
+}
+
+async function ensureDirectory(path: string): Promise<void> {
+  if (await exists(path)) return
+  const fm = fmOrThrow()
+  if (typeof fm.createDirectory === "function") {
+    await fm.createDirectory(path, true)
+    return
+  }
+  if (typeof fm.createDirectorySync === "function") {
+    fm.createDirectorySync(path, true)
+    return
+  }
+  throw new Error("FileManager.createDirectory is unavailable")
+}
+
+async function readString(path: string): Promise<string> {
+  const fm = fmOrThrow()
+  if (typeof fm.readAsString !== "function") throw new Error("FileManager.readAsString is unavailable")
+  return String(await fm.readAsString(path) ?? "")
+}
+
+/**
+ * File Provider can briefly report false from `exists()` for an iCloud file
+ * that is still readable through the security-scoped bookmark. Resource
+ * migration must not mistake that transient state for a missing file.
+ */
+async function resourceFileExists(path: string): Promise<boolean> {
+  if (await exists(path)) return true
+  try {
+    await readString(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function findLegacyResourcePath(
+  url: string,
+  kind: RemoteModuleResourceReference["kind"],
+  resourceRoot: string,
+  modulePath: string,
+  moduleName: string,
+): Promise<string> {
+  const legacyName = legacyResourceFileName(url, kind)
+  const candidates = [
+    ...legacyResourceDirectories(resourceRoot, modulePath, moduleName, kind)
+      .map((directory) => Path.join(directory, legacyName)),
+    resourcePath(resourceRoot, legacyName, kind),
+    Path.join(resourceRoot, legacyName),
+    Path.join(Path.dirname(modulePath), legacyName),
+  ]
+  for (const candidate of candidates) {
+    if (await resourceFileExists(candidate)) return candidate
+  }
+  return ""
+}
+
+function fetchTimeoutMessage(url: string): string {
+  return `Module resource download timed out (${RESOURCE_FETCH_TIMEOUT_MS / 1000}s): ${url}`
+}
+
+async function fetchResourceText(url: string): Promise<string> {
+  const fetchFn: any = (globalThis as any).fetch
+  if (typeof fetchFn !== "function") throw new Error("Offline resources cannot be downloaded because fetch is unavailable")
+
+  const isHTTP = /^http:\/\//i.test(url)
+  return withTimeout(
+    async () => {
+      const requestInit: any = {
+        headers: {
+          "User-Agent": "script-hub/1.0.0",
+          Accept: "application/javascript,text/javascript,text/plain,*/*",
+        },
+        timeout: RESOURCE_FETCH_TIMEOUT_MS / 1000,
+        debugLabel: "Surge module offline resources",
+        ...(isHTTP ? { allowInsecureRequest: true } : {}),
+      }
+      const RequestCtor: any = (globalThis as any).Request
+      const request = typeof RequestCtor === "function"
+        ? new RequestCtor(url, requestInit)
+        : null
+      const response = request ? await fetchFn(request) : await fetchFn(url, requestInit)
+      const status = Number(response?.status ?? 0)
+      if (status < 200 || status >= 400) {
+        throw new Error(`HTTP ${response?.status ?? "unknown"} ${response?.statusText ?? ""}`.trim())
+      }
+      const length = Number(response?.headers?.get?.("content-length") ?? 0)
+      if (length > MAX_RESOURCE_CHARS) throw new Error(`The module resource exceeds the ${MAX_RESOURCE_CHARS / 1024 / 1024} MiB limit. It was not written.`)
+      if (typeof response?.text !== "function") throw new Error("Response.text is unavailable")
+      const text = String(await response.text())
+      if (text.length > MAX_RESOURCE_CHARS) throw new Error(`The module resource exceeds the ${MAX_RESOURCE_CHARS / 1024 / 1024} MiB limit. It was not written.`)
+      return text
+    },
+    RESOURCE_FETCH_TIMEOUT_MS,
+    fetchTimeoutMessage(url),
+  )
+}
+
+function upsertLocalResourcesTag(content: string): string {
+  const line = "#!local-resources=true"
+  // Keep exactly one marker. `#!local-scripts` was the first beta marker;
+  // remove it when upgrading an already-localized module so repeated runs do
+  // not accumulate two sources of truth.
+  const lines = String(content ?? "").split(/\r?\n/g)
+  const withoutLegacyMarkers = lines.filter((item) => (
+    !/^\s*#!\s*(?:local-resources|local-scripts)\s*=.*$/i.test(item)
+  ))
+  return `${line}\n${withoutLegacyMarkers.join("\n")}`
+}
+
+async function writeResourceFile(path: string, content: string): Promise<FileChange> {
+  const snapshot = await snapshotText(path, RESOURCE_FILE_OPERATION_TIMEOUT_MS)
+  await ensureDirectory(Path.dirname(path))
+  await replaceTextVerified(
+    path,
+    content,
+    "Module resource",
+    RESOURCE_FILE_OPERATION_TIMEOUT_MS,
+  )
+  return {
+    path,
+    existed: snapshot.exists,
+    previous: snapshot.exists ? snapshot.content : undefined,
+  }
+}
+
+async function rollbackChanges(changes: FileChange[]): Promise<void> {
+  const failures: string[] = []
+  for (const change of [...changes].reverse()) {
+    try {
+      await restoreTextSnapshot(
+        change.path,
+        { exists: change.existed, content: change.previous ?? "" },
+        "Module resource rollback",
+        RESOURCE_FILE_OPERATION_TIMEOUT_MS,
+      )
+    } catch (error) {
+      failures.push(`${change.path}: ${String((error as any)?.message ?? error)}`)
+    }
+  }
+  if (failures.length) {
+    throw new Error(`Module resource rollback failed: ${failures.join(". ")}`)
+  }
+}
+
+/**
+ * Repair local references produced by older builds.
+ *
+ * Surge resolves a module's local `script-path`, `RULE-SET`, `DOMAIN-SET`,
+ * and `#!include` values from the Surge profile root. The only layout that is
+ * reliably discovered by both Surge and Files is therefore:
+ *
+ *   Surge/Script/timecard.js
+ *   Surge/Module/Offline/timecard.sgmodule  ->  script-path=Script/timecard.js
+ *
+ * Migrate hidden `.scripting-resources`, the intermediate `Scripts/...` tree,
+ * and old hash-suffixed root files into that canonical visible layout.
+ */
+async function rebaseExistingLocalResourcePaths(
+  content: string,
+  modulePath: string,
+  moduleName: string,
+  resourceRoot?: string,
+  changes: FileChange[] = [],
+): Promise<string> {
+  const references = extractLocalModuleResourceReferences(content)
+  if (!references.length) return content
+
+  const moduleDir = Path.dirname(modulePath)
+  const rootDir = String(resourceRoot ?? "").trim() || inferResourceRoot(modulePath)
+  const moduleRoot = Path.join(rootDir, "Module")
+  const modulesRoot = Path.join(rootDir, "Modules")
+  const replacements = new Map<string, string>()
+  const targetSources = new Map<string, string>()
+
+  function parentDirectory(path: string): string {
+    const normalized = String(path ?? "").replace(/\\/g, "/").replace(/\/+$/, "")
+    const index = normalized.lastIndexOf("/")
+    return index > 0 ? normalized.slice(0, index) : ""
+  }
+
+  function candidatePaths(value: string, kind: RemoteModuleResourceReference["kind"]): string[] {
+    if (value.startsWith("/")) return [value]
+    const candidates: string[] = []
+    const add = (candidate: string) => {
+      if (!candidate || candidates.includes(candidate)) return
+      candidates.push(candidate)
+    }
+
+    // Search the canonical visible resource directory first, then the old
+    // root-level and module/profile directories used by previous builds.
+    add(resourcePath(rootDir, pathBaseName(value), kind))
+    add(Path.join(rootDir, value))
+    add(Path.join(moduleDir, value))
+    add(Path.join(moduleRoot, value))
+    add(Path.join(modulesRoot, value))
+    for (const directory of legacyResourceDirectories(rootDir, modulePath, moduleName, kind)) {
+      add(Path.join(directory, pathBaseName(value)))
+    }
+
+    // v4.2.11 wrote a path relative to the outer `Surge` bookmark, for
+    // example `Module/Offline/.scripting-resources/...`. Walk the containing
+    // directory's ancestors so that migration can locate that file without
+    // downloading it again.
+    let ancestor = moduleDir
+    for (let index = 0; index < 8; index += 1) {
+      ancestor = parentDirectory(ancestor)
+      if (!ancestor) break
+      add(Path.join(ancestor, value))
+    }
+
+    return candidates
+  }
+
+  for (const reference of references) {
+    const value = String(reference.value ?? "").trim()
+    let physicalPath = ""
+    for (const candidate of candidatePaths(value, reference.kind)) {
+      if (await resourceFileExists(candidate)) {
+        physicalPath = candidate
+        break
+      }
+    }
+    if (!physicalPath) continue
+
+    // Always canonicalize an existing local reference into the visible
+    // resource directory. Scripts move to Surge/Script; the module file is
+    // never moved. This handles hidden legacy paths, the intermediate
+    // Scripts tree, and old hash-suffixed root files.
+    const visiblePath = resourcePath(
+      rootDir,
+      migratedResourceFileName(physicalPath, reference.kind, value),
+      reference.kind,
+    )
+    const previousSource = targetSources.get(visiblePath)
+    if (previousSource && previousSource !== physicalPath) {
+      throw new Error(`Local resource filename conflict: ${pathBaseName(visiblePath)} (${previousSource} and ${physicalPath})`)
+    }
+    targetSources.set(visiblePath, physicalPath)
+    const sourceText = await readString(physicalPath)
+    let currentText: string | undefined
+    if (await resourceFileExists(visiblePath)) {
+      try { currentText = await readString(visiblePath) } catch {}
+    }
+    if (currentText !== undefined && currentText !== sourceText && visiblePath !== physicalPath) {
+      throw new Error(`A resource in the Surge root already uses this filename with different content: ${pathBaseName(visiblePath)}`)
+    }
+    if (currentText !== sourceText) {
+      changes.push(await writeResourceFile(visiblePath, sourceText))
+    }
+
+    const relative = relativeProfilePath(rootDir, visiblePath)
+    if (relative && relative !== value) {
+      replacements.set(`${reference.kind}:${value}`, relative)
+    }
+  }
+
+  if (!replacements.size) return content
+  return rewriteModuleResourceReferences(content, references, replacements)
+}
+
+type LocalResourceRecoveryResult = {
+  content: string
+  recoveredCount: number
+}
+
+/**
+ * Repair a module that claims to be localized but has lost one or more of its
+ * local files. This is intentionally source-driven and generic: it unwraps
+ * the original module URL, matches the source resource by kind/basename, and
+ * writes it using the filename already present in the local module.
+ */
+async function recoverMissingLocalResources(
+  content: string,
+  rootDir: string,
+  changes: FileChange[],
+): Promise<LocalResourceRecoveryResult> {
+  const references = extractLocalModuleResourceReferences(content)
+  const missing: RemoteModuleResourceReference[] = []
+  for (const [index, reference] of references.entries()) {
+    const first = references.findIndex((item) => (
+      item.kind === reference.kind && item.value === reference.value
+    ))
+    if (first !== index) continue
+    const value = String(reference.value ?? "").trim()
+    const path = value.startsWith("/") ? value : Path.join(rootDir, value)
+    if (!(await resourceFileExists(path))) missing.push(reference)
+  }
+  if (!missing.length) return { content, recoveredCount: 0 }
+
+  let sourceReferences: RemoteModuleResourceReference[] = []
+  for (const sourceURL of moduleSourceCandidates(content)) {
+    try {
+      const sourceText = await fetchResourceText(sourceURL)
+      const parsed = extractRemoteModuleResourceReferences(sourceText)
+      if (parsed.length) {
+        sourceReferences = parsed
+        break
+      }
+    } catch {}
+  }
+  if (!sourceReferences.length) return { content, recoveredCount: 0 }
+
+  const resourceTexts = new Map<string, string>()
+  const targetURLs = new Map<string, string>()
+  const replacements = new Map<string, string>()
+  let recoveredCount = 0
+  for (const localReference of missing) {
+    const remoteReference = chooseRecoveryReference(localReference, sourceReferences)
+    if (!remoteReference) continue
+    const filePath = resourcePath(
+      rootDir,
+      migratedResourceFileName(remoteReference.value, localReference.kind, localReference.value),
+      localReference.kind,
+    )
+    const previousURL = targetURLs.get(filePath)
+    if (previousURL && previousURL !== remoteReference.value) {
+      throw new Error("Resource recovery filename conflict: " + pathBaseName(filePath) + " (" + previousURL + " and " + remoteReference.value + ")")
+    }
+    targetURLs.set(filePath, remoteReference.value)
+    let resourceText = resourceTexts.get(remoteReference.value)
+    if (resourceText === undefined) {
+      resourceText = await fetchResourceText(remoteReference.value)
+      resourceTexts.set(remoteReference.value, resourceText)
+    }
+    const current = await (async () => {
+      if (!(await resourceFileExists(filePath))) return undefined
+      try { return await readString(filePath) } catch { return undefined }
+    })()
+    if (current !== resourceText) changes.push(await writeResourceFile(filePath, resourceText))
+    const relative = relativeProfilePath(rootDir, filePath)
+    replacements.set(`${localReference.kind}:${localReference.value}`, relative)
+    recoveredCount += 1
+  }
+
+  return {
+    content: replacements.size
+      ? rewriteModuleResourceReferences(content, references, replacements)
+      : content,
+    recoveredCount,
+  }
+}
+
+export type LocalResourcePathSyncResult = {
+  content: string
+  migratedCount: number
+  rollback: () => Promise<void>
+}
+
+/**
+ * Synchronize paths for resources that are already local. By default this is
+ * offline; callers may explicitly enable recovery for a module that claims to
+ * be localized but has lost one of its files.
+ */
+export async function syncLocalModuleResourcePaths(
+  content: string,
+  _info: Pick<ModuleInfo, "name">,
+  modulePath: string,
+  resourceRoot?: string,
+  options: { recoverMissingResources?: boolean } = {},
+): Promise<LocalResourcePathSyncResult> {
+  const changes: FileChange[] = []
+  const rootDir = String(resourceRoot ?? "").trim() || inferResourceRoot(modulePath)
+  try {
+    let rebasedContent = await rebaseExistingLocalResourcePaths(
+      content,
+      modulePath,
+      _info.name,
+      rootDir,
+      changes,
+    )
+    if (options.recoverMissingResources) {
+      rebasedContent = (await recoverMissingLocalResources(rebasedContent, rootDir, changes)).content
+    }
+    const localReferences = extractLocalModuleResourceReferences(rebasedContent)
+    if (localReferences.length) await verifyLocalResourcePaths(rebasedContent, rootDir)
+    return {
+      content: rebasedContent,
+      migratedCount: changes.length,
+      rollback: () => rollbackChanges(changes),
+    }
+  } catch (error) {
+    await rollbackChanges(changes)
+    throw new Error(`Could not sync local module paths: ${String((error as any)?.message ?? error)}`)
+  }
+}
+
+async function verifyLocalResourcePaths(
+  content: string,
+  resourceRoot: string,
+): Promise<void> {
+  const references = extractLocalModuleResourceReferences(content)
+  for (const reference of references) {
+    const value = String(reference.value ?? "").trim()
+    const path = value.startsWith("/") ? value : Path.join(resourceRoot, value)
+    if (!(await resourceFileExists(path))) {
+      throw new Error(`Local resource not found: ${value}`)
+    }
+  }
+}
+
+/**
+ * Download all remote module resources and return module text pointing to
+ * local files. The caller owns the returned rollback callback and should call
+ * it if the enclosing module write fails.
+ */
+export async function localizeModuleResources(
+  content: string,
+  _info: Pick<ModuleInfo, "name">,
+  modulePath: string,
+  resourceRoot?: string,
+): Promise<ScriptLocalizationResult> {
+  const replacements = new Map<string, string>()
+  const changes: FileChange[] = []
+  const rootDir = String(resourceRoot ?? "").trim() || inferResourceRoot(modulePath)
+
+  // First repair paths already pointing at a local resource. This path
+  // is deliberately offline: a local module should not be re-fetched merely
+  // because its resource references were written using the old hidden base.
+  let rebasedContent = content
+  try {
+    rebasedContent = await rebaseExistingLocalResourcePaths(
+      content,
+      modulePath,
+      _info.name,
+      rootDir,
+      changes,
+    )
+  } catch (error) {
+    await rollbackChanges(changes)
+    throw new Error(`Module resource migration failed: ${String((error as any)?.message ?? error)}`)
+  }
+  let recoveredCount = 0
+  try {
+    const recovered = await recoverMissingLocalResources(rebasedContent, rootDir, changes)
+    rebasedContent = recovered.content
+    recoveredCount = recovered.recoveredCount
+  } catch (error) {
+    await rollbackChanges(changes)
+    throw new Error(`Could not restore a missing local resource: ${String((error as any)?.message ?? error)}`)
+  }
+  const references = extractRemoteModuleResourceReferences(rebasedContent)
+  if (!references.length) {
+    const hasLocalizationMarker =
+      /^\s*#!\s*(?:local-resources|local-scripts)\s*=/im.test(rebasedContent) ||
+      extractLocalModuleResourceReferences(rebasedContent).length > 0
+    if (hasLocalizationMarker) {
+      await verifyLocalResourcePaths(rebasedContent, rootDir)
+    }
+    return {
+      // A beta build used `#!local-scripts`; normalize that marker even when
+      // all resource references have already been rewritten locally.
+      content: hasLocalizationMarker ? upsertLocalResourcesTag(rebasedContent) : rebasedContent,
+      localizedCount: recoveredCount,
+      scriptCount: 0,
+      ruleSetCount: 0,
+      domainSetCount: 0,
+      includeCount: 0,
+      resourceURLs: [],
+      rollback: () => rollbackChanges(changes),
+    }
+  }
+
+  const uniqueResources = Array.from(
+    new Map(references.map((ref) => [`${ref.kind}:${ref.value}`, ref])).values(),
+  )
+  const targetURLs = new Map<string, string>()
+  const resourceTexts = new Map<string, string>()
+
+  try {
+    for (const reference of uniqueResources) {
+      const filePath = resourcePath(
+        rootDir,
+        resourceFileName(reference.value, reference.kind),
+        reference.kind,
+      )
+      const previousURL = targetURLs.get(filePath)
+      if (previousURL && previousURL !== reference.value) {
+        throw new Error(`Remote resource filename conflict: ${pathBaseName(filePath)} (${previousURL} and ${reference.value})`)
+      }
+      targetURLs.set(filePath, reference.value)
+      const relative = relativeProfilePath(rootDir, filePath)
+      let resourceText = resourceTexts.get(filePath)
+      if (resourceText === undefined) {
+        const legacyPath = await findLegacyResourcePath(
+          reference.value,
+          reference.kind,
+          rootDir,
+          modulePath,
+          _info.name,
+        )
+        resourceText = legacyPath
+          ? await readString(legacyPath)
+          : await fetchResourceText(reference.value)
+        resourceTexts.set(filePath, resourceText)
+      }
+      const current = await (async () => {
+        if (!(await resourceFileExists(filePath))) return undefined
+        try { return await readString(filePath) } catch { return undefined }
+      })()
+      if (current !== resourceText) {
+        changes.push(await writeResourceFile(filePath, resourceText))
+      }
+      // Include the resource kind in the key. The same URL can legally be
+      // used by two directives, but each directive still gets a stable file
+      // name and its own rewritten reference.
+      replacements.set(`${reference.kind}:${reference.value}`, relative)
+    }
+
+    const counts = uniqueResources.reduce(
+      (result, reference) => {
+        if (reference.kind === "script") result.scriptCount += 1
+        if (reference.kind === "ruleset") result.ruleSetCount += 1
+        if (reference.kind === "domainset") result.domainSetCount += 1
+        if (reference.kind === "include") result.includeCount += 1
+        return result
+      },
+      { scriptCount: 0, ruleSetCount: 0, domainSetCount: 0, includeCount: 0 },
+    )
+
+    const localizedContent = upsertLocalResourcesTag(rewriteRemoteModuleResources(rebasedContent, replacements))
+    await verifyLocalResourcePaths(localizedContent, rootDir)
+    const remainingRemoteReferences = extractRemoteModuleResourceReferences(localizedContent)
+    if (remainingRemoteReferences.length) {
+      throw new Error(`The module still has ${remainingRemoteReferences.length} remote resource references. The file was not written.`)
+    }
+    return {
+      content: localizedContent,
+      localizedCount: uniqueResources.length + recoveredCount,
+      ...counts,
+      resourceURLs: uniqueResources.map((reference) => reference.value),
+      rollback: () => rollbackChanges(changes),
+    }
+  } catch (error) {
+    await rollbackChanges(changes)
+    throw new Error(`Could not download module resources for offline use: ${String((error as any)?.message ?? error)}`)
+  }
+}
